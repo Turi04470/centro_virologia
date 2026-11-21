@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CentroCiberseguridad.Web/CentroCiberseguridad.Web.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CentroCiberseguridad.Tests/CentroCiberseguridad.Tests.csproj" />
+  </Folder>
+</Solution>
