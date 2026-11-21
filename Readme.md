@@ -1,5 +1,21 @@
 # NODO-04 — Centro de Ciberseguridad
 
+## Requisitos (Windows)
+
+- **.NET 10 SDK** (necesario solo para ejecutar o compilar desde código fuente):
+  ```powershell
+  winget install Microsoft.DotNet.SDK.10
+  ```
+  O descárgalo desde: https://dotnet.microsoft.com/download/dotnet/10.0
+
+  Verifica la instalación en PowerShell:
+  ```powershell
+  dotnet --version
+  ```
+- **SQLite:** **No requiere instalación** en Windows. Ya viene embebido mediante `Microsoft.Data.Sqlite` y el archivo `ciberseguridad.db` se crea automáticamente al iniciar la aplicación.
+
+---
+
 Abre una terminal en la carpeta raíz del proyecto (`Proyecto`).
 
 ## Ejecutar / Depurar
