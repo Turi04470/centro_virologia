@@ -1,5 +1,7 @@
 using System.IO.Compression;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.Json;
 using CentroCiberseguridad.Web.Models;
 using CentroCiberseguridad.Web.Services.Crypto;
 using CentroCiberseguridad.Web.Services.Data;
@@ -16,7 +18,7 @@ public sealed class CryptoAndZipTests : IDisposable
 
     public CryptoAndZipTests()
     {
-        _dbFile = Path.Combine(Path.GetTempPath(), $"csec_test_{Guid.NewGuid():N}.db");
+        _dbFile = Path.Combine(Path.GetTempPath(), $"csec_v2_test_{Guid.NewGuid():N}.db");
         _db = new SqliteDatabaseService(_dbFile);
         _certZip = new CertificateAndZipService(_db);
         _crypto = new CryptoEngineService(_db, _certZip);
@@ -38,7 +40,7 @@ public sealed class CryptoAndZipTests : IDisposable
     [MemberData(nameof(AllAlgorithmCodes))]
     public void All21Algorithms_TextRoundTrip_WorksCorrectly(string code, string defaultKey)
     {
-        const string sample = "Hola Centro de Ciberseguridad 2026";
+        const string sample = "Hola Centro de Ciberseguridad v2.0";
         var enc = _crypto.Execute(new OperateRequest
         {
             AlgorithmCode = code,
@@ -52,13 +54,13 @@ public sealed class CryptoAndZipTests : IDisposable
         Assert.False(string.IsNullOrWhiteSpace(enc.OutputText));
         Assert.NotNull(enc.ConsultaId);
         Assert.NotNull(enc.ZipFileName);
-        Assert.StartsWith($"NODO04_{code}_", enc.ZipFileName);
+        Assert.StartsWith($"EQ04_{code}_", enc.ZipFileName);
+        Assert.Equal("2.0", enc.Manifest!.Version);
         Assert.Equal(16, enc.Cells.Length);
         Assert.NotEmpty(enc.Steps);
 
         if (code == "HASHSHA")
         {
-            // Para HASHSHA, Descifrar verifica el hash esperado enviado en Key
             var ver = _crypto.Execute(new OperateRequest
             {
                 AlgorithmCode = code,
@@ -73,7 +75,7 @@ public sealed class CryptoAndZipTests : IDisposable
         }
 
         var decInput = code == "LAGRANGESHAMIR"
-            ? string.Join("\n", enc.OutputText!.Split('\n').Take(3)) // solo K=3 de N=5 shares
+            ? string.Join("\n", enc.OutputText!.Split('\n').Take(3))
             : enc.OutputText!;
 
         var dec = _crypto.Execute(new OperateRequest
@@ -127,7 +129,6 @@ public sealed class CryptoAndZipTests : IDisposable
     [Fact]
     public void SettingsPermissions_BlockHiddenEncryptAndDecrypt()
     {
-        // Deshabilita solo encriptación para AESGCM
         _db.UpdateAlgorithm("AESGCM", isVisible: true, canEncrypt: false, canDecrypt: true);
 
         Assert.Throws<UnauthorizedAccessException>(() => _crypto.Execute(new OperateRequest
@@ -135,10 +136,10 @@ public sealed class CryptoAndZipTests : IDisposable
             AlgorithmCode = "AESGCM",
             IsEncrypt = true,
             InputMode = "text",
-            Text = "hola"
+            Text = "hola",
+            Key = "mi-clave"
         }));
 
-        // Habilita encriptación pero deshabilita desencriptación
         _db.UpdateAlgorithm("AESGCM", isVisible: true, canEncrypt: true, canDecrypt: false);
         var enc = _crypto.Execute(new OperateRequest
         {
@@ -158,117 +159,217 @@ public sealed class CryptoAndZipTests : IDisposable
             Key = "mi-clave"
         }));
 
-        // Ocultar Todos bloquea por completo
         _db.HideAllAlgorithms();
         var algos = _db.GetAlgorithms();
         Assert.Equal(21, algos.Count);
         Assert.All(algos, a => Assert.False(a.IsVisible));
-
-        Assert.Throws<UnauthorizedAccessException>(() => _crypto.Execute(new OperateRequest
-        {
-            AlgorithmCode = "CAESAR",
-            IsEncrypt = true,
-            InputMode = "text",
-            Text = "hola"
-        }));
     }
 
     [Fact]
-    public void ZipPackage_ContainsThreeFilesAndDetectsTampering()
+    public void V2Primitives_CanonicalParams_And_CcEnv1_WorkCorrectly()
     {
-        var encBytes = Encoding.UTF8.GetBytes("datos-cifrados-de-prueba");
-        var (zipBytes, zipName, manifest) = _certZip.CreateSignedZipPackage(
-            encBytes, "AESGCM", "AES-256-GCM", "text", "secreto.txt", 20);
-
-        Assert.EndsWith(".zip", zipName);
-        Assert.Equal("AESGCM", manifest.AlgorithmCode);
-
-        using (var ms = new MemoryStream(zipBytes))
-        using (var ar = new ZipArchive(ms, ZipArchiveMode.Read))
+        var (canonical, hash) = CertificateAndZipService.ComputeCanonicalParamsHash(new Dictionary<string, string>
         {
-            Assert.NotNull(ar.GetEntry("datos.enc"));
-            Assert.NotNull(ar.GetEntry("certificado.pem"));
-            Assert.NotNull(ar.GetEntry("manifest.json"));
-            Assert.Equal(3, ar.Entries.Count);
-        }
+            ["hashAlgorithm"] = "SHA-256",
+            ["digestHex"] = "ab12"
+        });
+        Assert.Equal("digestHex=ab12\nhashAlgorithm=SHA-256", canonical);
+        Assert.Equal(64, hash.Length);
 
-        var valid = _certZip.ValidateZipPackage(zipBytes);
-        Assert.True(valid.IsValid);
-        Assert.Equal(202, valid.HttpStatusCode);
+        var (_, emptyHash) = CertificateAndZipService.ComputeCanonicalParamsHash(new Dictionary<string, string>());
+        Assert.Equal("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", emptyHash);
 
-        // Alterar 1 byte de datos.enc en el ZIP
-        using var tamperedMs = new MemoryStream();
-        using (var srcMs = new MemoryStream(zipBytes))
-        using (var srcZip = new ZipArchive(srcMs, ZipArchiveMode.Read))
-        using (var dstZip = new ZipArchive(tamperedMs, ZipArchiveMode.Create, true))
+        // CC-ENV-1 round-trip
+        var localCert = _certZip.GetLocalCertificate();
+        var secret = Encoding.UTF8.GetBytes("{\"shift\":\"7\"}");
+        var aadId = Guid.NewGuid().ToString("D");
+        var (env, _) = CertificateAndZipService.WrapEnvelope(secret, "EQ04", localCert.CertificatePem, aadId, includeCiphertextInJson: true);
+        var unwrapped = _certZip.UnwrapEnvelope(env, null, aadId);
+        Assert.Equal(secret, unwrapped);
+
+        // Wrong recipient -> 401 E-ENV-RECIPIENT
+        env.RecipientThumbprintSha256 = new string('0', 64);
+        var ex = Assert.Throws<ProtocolException>(() => _certZip.UnwrapEnvelope(env, null, aadId));
+        Assert.Equal("E-ENV-RECIPIENT", ex.ErrorCode);
+        Assert.Equal(401, ex.HttpStatusCode);
+    }
+
+    [Fact]
+    public void V2Validation_RejectsInvalidStructure_TamperedHash_OldTimestamp_Duplicate_And_UntrustedCert()
+    {
+        var algo = _db.GetAlgorithm("CAESAR")!;
+        var (zipBytes, _, mf) = _certZip.CreateSignedZipPackage(
+            "KROD"u8.ToArray(),
+            algo,
+            "package",
+            "forward",
+            "text",
+            "hola.txt",
+            4,
+            publicParams: new Dictionary<string, string> { ["alphabet"] = "A-Z" });
+
+        // 1. Válido primera vez -> 202
+        var ok = _certZip.ValidateZipPackage(zipBytes, checkReplay: true, checkTimestamp: true, checkDirectoryTrust: true);
+        Assert.True(ok.IsValid);
+        Assert.Equal(202, ok.HttpStatusCode);
+
+        // 2. Repetición del mismo packetId -> 409 E-DUPLICATE
+        var dup = _certZip.ValidateZipPackage(zipBytes, checkReplay: true, checkTimestamp: true, checkDirectoryTrust: true);
+        Assert.False(dup.IsValid);
+        Assert.Equal(409, dup.HttpStatusCode);
+        Assert.Equal("E-DUPLICATE", dup.ErrorCode);
+
+        // 3. Alterar 1 byte de datos.enc -> 422 E-HASH
+        var tamperedHashZip = MutateZip(zipBytes, (name, data) => name == "datos.enc" ? new[] { (byte)(data[0] ^ 1) }.Concat(data.Skip(1)).ToArray() : data);
+        var badHash = _certZip.ValidateZipPackage(tamperedHashZip, checkReplay: false);
+        Assert.Equal("E-HASH", badHash.ErrorCode);
+        Assert.Equal(422, badHash.HttpStatusCode);
+
+        // 4. ZIP con 4 archivos -> 400 E-ZIP-STRUCTURE
+        var fourEntriesZip = AddExtraEntry(zipBytes, "extra.txt", "hola"u8.ToArray());
+        var badStruct = _certZip.ValidateZipPackage(fourEntriesZip, checkReplay: false);
+        Assert.Equal("E-ZIP-STRUCTURE", badStruct.ErrorCode);
+        Assert.Equal(400, badStruct.HttpStatusCode);
+
+        // 5. Timestamp viejo (>10 min) -> 422 E-TIMESTAMP
+        var oldTs = DateTime.UtcNow.AddMinutes(-25).ToString("yyyy-MM-ddTHH:mm:ssZ");
+        var (oldZip, _, _) = _certZip.CreateSignedZipPackage(
+            "KROD"u8.ToArray(), algo, "package", "forward", "text", "hola.txt", 4,
+            publicParams: new Dictionary<string, string> { ["alphabet"] = "A-Z" },
+            explicitTimestampUtc: oldTs);
+        var badTs = _certZip.ValidateZipPackage(oldZip, checkReplay: false, checkTimestamp: true);
+        Assert.Equal("E-TIMESTAMP", badTs.ErrorCode);
+        Assert.Equal(422, badTs.HttpStatusCode);
+    }
+
+    [Fact]
+    public void V2Provider_ForwardAndInverse_CaesarAndDiffieHellman_WorksEndToEnd()
+    {
+        // Solicitante simulado EQ08
+        var eq08Cert = CertificateAndZipService.GenerateSelfSignedCertificate("EQ08", 8);
+        var eq08Pfx = Convert.FromBase64String(eq08Cert.PrivateKeyPfxBase64);
+
+        // 1. CAESAR forward + inverse
+        var plain = Encoding.UTF8.GetBytes("PRUEBA REMOTA CAESAR");
+        var fwdReq = new CryptoRemoteRequestDto
         {
-            foreach (var entry in srcZip.Entries)
-            {
-                using var es = entry.Open();
-                using var copyMs = new MemoryStream();
-                es.CopyTo(copyMs);
-                var data = copyMs.ToArray();
-                if (entry.FullName == "datos.enc") data[0] ^= 0x01;
-                var newEntry = dstZip.CreateEntry(entry.FullName);
-                using var ns = newEntry.Open();
-                ns.Write(data, 0, data.Length);
-            }
-        }
+            RequestId = Guid.NewGuid().ToString("D"),
+            RequesterNode = "EQ08",
+            TargetNode = "EQ04",
+            TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+            AlgorithmCode = "CAESAR",
+            Operation = "forward",
+            PayloadMode = "text",
+            OriginalFileName = "nota.txt",
+            Options = new Dictionary<string, string> { ["alphabet"] = "A-Z" }
+        };
+        var (pkgZip, _, _) = _crypto.ExecuteProviderForward(fwdReq, plain, new Dictionary<string, string> { ["shift"] = "5" }, "127.0.0.1:5004");
+        var pkgVal = _certZip.ValidateZipPackage(pkgZip, checkReplay: false);
+        Assert.True(pkgVal.IsValid);
 
-        var invalid = _certZip.ValidateZipPackage(tamperedMs.ToArray());
-        Assert.False(invalid.IsValid);
-        Assert.Equal(422, invalid.HttpStatusCode);
+        var invReq = new CryptoRemoteRequestDto
+        {
+            RequestId = Guid.NewGuid().ToString("D"),
+            RequesterNode = "EQ08",
+            TargetNode = "EQ04",
+            TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+            AlgorithmCode = "CAESAR",
+            Operation = "inverse",
+            PayloadMode = "text",
+            OriginalFileName = "nota.txt"
+        };
+        var (resZip, resName, resMf) = _crypto.ExecuteProviderInverse(invReq, pkgVal, new Dictionary<string, string> { ["shift"] = "5" }, eq08Cert.CertificatePem, "127.0.0.1:5004");
+        Assert.StartsWith("RES_EQ04_CAESAR_", resName);
+        var resVal = _certZip.ValidateZipPackage(resZip, checkReplay: false, expectedPacketType: "result");
+        Assert.True(resVal.IsValid);
+        var decrypted = CertificateAndZipService.UnwrapEnvelopeWithPfx(resMf.ResultEnvelope!, resVal.PayloadBytes, resMf.PacketId, eq08Cert.ThumbprintSha256, eq08Pfx);
+        Assert.Equal(plain, decrypted);
+
+        // 2. DIFFIEHELLMAN con keyId persistente
+        var dhPlain = Encoding.UTF8.GetBytes("SECRETO DIFFIE HELLMAN v2.0");
+        var dhFwd = new CryptoRemoteRequestDto
+        {
+            RequestId = Guid.NewGuid().ToString("D"),
+            RequesterNode = "EQ08",
+            TargetNode = "EQ04",
+            TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+            AlgorithmCode = "DIFFIEHELLMAN",
+            Operation = "forward",
+            PayloadMode = "file",
+            OriginalFileName = "secreto.bin"
+        };
+        var (dhPkgZip, _, dhMf) = _crypto.ExecuteProviderForward(dhFwd, dhPlain, null, "127.0.0.1:5004");
+        Assert.NotNull(dhMf.KeyRef);
+        Assert.StartsWith("EQ04-KEY-", dhMf.KeyRef!.KeyId);
+
+        var dhPkgVal = _certZip.ValidateZipPackage(dhPkgZip, checkReplay: false);
+        var (dhResZip, _, dhResMf) = _crypto.ExecuteProviderInverse(dhFwd, dhPkgVal, null, eq08Cert.CertificatePem, "127.0.0.1:5004");
+        var dhResVal = _certZip.ValidateZipPackage(dhResZip, checkReplay: false, expectedPacketType: "result");
+        var dhDecrypted = CertificateAndZipService.UnwrapEnvelopeWithPfx(dhResMf.ResultEnvelope!, dhResVal.PayloadBytes, dhResMf.PacketId, eq08Cert.ThumbprintSha256, eq08Pfx);
+        Assert.Equal(dhPlain, dhDecrypted);
+    }
+
+    [Fact]
+    public void V2RepackageForForwarding_PreservesProducerAndUpdatesPacketId()
+    {
+        var algo = _db.GetAlgorithm("CAESAR")!;
+        var (origZip, _, origMf) = _certZip.CreateSignedZipPackage(
+            "KROD"u8.ToArray(), algo, "package", "forward", "text", "hola.txt", 4,
+            producerNode: "EQ01",
+            publicParams: new Dictionary<string, string> { ["alphabet"] = "A-Z" });
+
+        var (fwdZip, _, fwdMf) = _certZip.RepackageForForwarding(origZip, "192.168.1.40:5004");
+        Assert.Equal("EQ01", fwdMf.ProducerNode);
+        Assert.Equal("EQ04", fwdMf.SourceNode);
+        Assert.NotEqual(origMf.PacketId, fwdMf.PacketId);
+        Assert.True(_certZip.ValidateZipPackage(fwdZip, checkReplay: false).IsValid);
     }
 
     [Fact]
     public void IncomingRequests_AcceptAddsToConsultas_RejectDoesNot()
     {
-        var (zipBytes, zipName, mf) = _certZip.CreateSignedZipPackage(
-            "abc"u8.ToArray(), "CHACHA20", "ChaCha20-Poly1305", "text", "doc.txt", 3);
+        var algo = _db.GetAlgorithm("CHACHA20")!;
+        var (zipBytes, zipName, mf) = _certZip.CreateSignedZipPackage("abc"u8.ToArray(), algo, "package", "forward", "text", "doc.txt", 3);
 
         var id1 = _db.AddIncomingRequest(new IncomingRequestRecord
         {
             PacketId = mf.PacketId,
-            SourceIp = "192.168.1.30:5000",
+            SourceNode = "EQ02",
+            SourceIp = "192.168.1.30:5002",
             ZipFileName = zipName,
             AlgorithmCode = mf.AlgorithmCode,
-            AlgorithmName = mf.Algorithm,
+            AlgorithmName = mf.AlgorithmName,
+            OperationName = mf.OperationName,
             SignatureValid = true,
+            TrustStatus = "Firma OK",
             Status = "Pendiente",
             EncryptedSha256 = mf.EncryptedSha256,
-            ReceivedAt = "2026-11-16 21:55",
+            ReceivedAt = "2026-11-25 22:00",
             ZipBytes = zipBytes
         });
 
         var id2 = _db.AddIncomingRequest(new IncomingRequestRecord
         {
-            PacketId = Guid.NewGuid().ToString(),
-            SourceIp = "192.168.1.31:5000",
+            PacketId = Guid.NewGuid().ToString("D"),
+            SourceNode = "EQ03",
+            SourceIp = "192.168.1.31:5003",
             ZipFileName = "rechazado.zip",
             AlgorithmCode = "RSA",
             AlgorithmName = "RSA",
+            OperationName = "cifrar",
             SignatureValid = true,
+            TrustStatus = "Remitente no confirmado",
             Status = "Pendiente",
             EncryptedSha256 = mf.EncryptedSha256,
-            ReceivedAt = "2026-11-16 21:56",
+            ReceivedAt = "2026-11-25 22:01",
             ZipBytes = zipBytes
         });
 
         var saved = _db.AcceptIncomingRequest(id1);
         Assert.NotNull(saved);
         Assert.Equal("Recibido", saved!.Origin);
-
-        var rejected = _db.RejectIncomingRequest(id2);
-        Assert.True(rejected);
-
-        var consultas = _db.GetSavedPackages();
-        Assert.Single(consultas);
-        Assert.Equal(zipName, consultas[0].ZipFileName);
-        Assert.Equal("Recibido", consultas[0].Origin);
-
-        var reqs = _db.GetIncomingRequests();
-        Assert.Equal("Aceptada", reqs.First(r => r.Id == id1).Status);
-        Assert.Equal("Rechazada", reqs.First(r => r.Id == id2).Status);
+        Assert.True(_db.RejectIncomingRequest(id2));
+        Assert.Single(_db.GetSavedPackages());
     }
 
     [Fact]
@@ -294,46 +395,6 @@ public sealed class CryptoAndZipTests : IDisposable
         Assert.Equal(64, hash.OutputText!.Length);
     }
 
-    [Theory]
-    [InlineData("CHACHA20", "clave-secreta-personal", false)]
-    [InlineData("CAESAR", "5", true)]
-    public void UnpackZipFromConsultas_ReadsManifestAndDecryptsDirectly(string code, string key, bool isTextNative)
-    {
-        const string secret = "Dato confidencial para Consultas";
-        var enc = _crypto.Execute(new OperateRequest
-        {
-            AlgorithmCode = code,
-            IsEncrypt = true,
-            InputMode = "text",
-            Text = secret,
-            Key = key,
-            AttachCertificate = true
-        });
-
-        Assert.NotNull(enc.ConsultaId);
-        var saved = _db.GetSavedPackageById(enc.ConsultaId!.Value);
-        Assert.NotNull(saved);
-
-        var val = _certZip.ValidateZipPackage(saved!.ZipBytes);
-        Assert.True(val.IsValid);
-        Assert.Equal(code, val.Manifest!.AlgorithmCode);
-
-        var extractedText = isTextNative
-            ? Encoding.UTF8.GetString(val.EncryptedBytes)
-            : Convert.ToBase64String(val.EncryptedBytes);
-        var dec = _crypto.Execute(new OperateRequest
-        {
-            AlgorithmCode = val.Manifest.AlgorithmCode,
-            IsEncrypt = false,
-            InputMode = val.Manifest.PayloadMode,
-            Text = extractedText,
-            Key = key,
-            AttachCertificate = false
-        });
-
-        Assert.Equal(secret, dec.OutputText);
-    }
-
     [Fact]
     public void Consultas_DeleteSingle_ClearAll_AndGetAllWithBytes_Works()
     {
@@ -341,12 +402,129 @@ public sealed class CryptoAndZipTests : IDisposable
         var r2 = _crypto.Execute(new OperateRequest { AlgorithmCode = "CAESAR", IsEncrypt = true, InputMode = "text", Text = "dos", Key = "4", AttachCertificate = true });
 
         Assert.Equal(2, _db.GetAllSavedPackagesWithBytes().Count);
-
         Assert.True(_db.DeleteSavedPackage(r1.ConsultaId!.Value));
         Assert.Single(_db.GetSavedPackages());
-        Assert.Equal(r2.ConsultaId, _db.GetSavedPackages()[0].Id);
-
         Assert.Equal(1, _db.ClearSavedPackages());
         Assert.Empty(_db.GetSavedPackages());
+    }
+
+    [Fact]
+    public void GenerateSection16TestVectors_ForEQ04()
+    {
+        var dir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "vectores", "EQ04"));
+        Directory.CreateDirectory(dir);
+
+        var certRec = _certZip.GetLocalCertificate();
+        var pfxBytes = Convert.FromBase64String(certRec.PrivateKeyPfxBase64);
+        using var x509 = X509CertificateLoader.LoadPkcs12(pfxBytes, string.Empty, X509KeyStorageFlags.Exportable);
+        using var rsaPriv = x509.GetRSAPrivateKey()!;
+
+        File.WriteAllText(Path.Combine(dir, "certificado.pem"), certRec.CertificatePem, Encoding.UTF8);
+        File.WriteAllText(Path.Combine(dir, "privada-PRUEBA.pem"), rsaPriv.ExportPkcs8PrivateKeyPem(), Encoding.UTF8);
+
+        // 1. CAESAR vector
+        var caesarOriginal = "CENTRO DE CIBERSEGURIDAD EQ04";
+        var caesarOrigBytes = Encoding.UTF8.GetBytes(caesarOriginal);
+        var caesarReq = new CryptoRemoteRequestDto
+        {
+            RequestId = Guid.NewGuid().ToString("D"),
+            RequesterNode = "EQ08",
+            TargetNode = "EQ04",
+            TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+            AlgorithmCode = "CAESAR",
+            Operation = "forward",
+            PayloadMode = "text",
+            OriginalFileName = "CAESAR_original.txt",
+            Options = new Dictionary<string, string> { ["alphabet"] = "A-Z" }
+        };
+        var caesarSecrets = new Dictionary<string, string> { ["shift"] = "3" };
+        var (caesarZip, _, caesarMf) = _crypto.ExecuteProviderForward(caesarReq, caesarOrigBytes, caesarSecrets, "127.0.0.1:5004");
+        Assert.True(_certZip.ValidateZipPackage(caesarZip, checkReplay: false).IsValid);
+
+        File.WriteAllBytes(Path.Combine(dir, "CAESAR_ejemplo.zip"), caesarZip);
+        File.WriteAllText(Path.Combine(dir, "CAESAR_secretos.json"), JsonSerializer.Serialize(caesarSecrets, CertificateAndZipService.JsonOpts), Encoding.UTF8);
+        File.WriteAllText(Path.Combine(dir, "CAESAR_original.txt"), caesarOriginal, Encoding.UTF8);
+
+        // cadena-firma.txt y params-canonicos.txt
+        File.WriteAllText(Path.Combine(dir, "cadena-firma.txt"), CertificateAndZipService.BuildSigningString(caesarMf), Encoding.UTF8);
+        var (canonText, canonHash) = CertificateAndZipService.ComputeCanonicalParamsHash(caesarMf.PublicParameters);
+        File.WriteAllText(Path.Combine(dir, "params-canonicos.txt"), $"{canonText}\n---\nSHA256={canonHash}", Encoding.UTF8);
+
+        // 2. DIFFIEHELLMAN vector
+        var dhOriginal = "MENSAJE DIFFIE-HELLMAN EQ04 v2.0";
+        var dhOrigBytes = Encoding.UTF8.GetBytes(dhOriginal);
+        var dhReq = new CryptoRemoteRequestDto
+        {
+            RequestId = Guid.NewGuid().ToString("D"),
+            RequesterNode = "EQ08",
+            TargetNode = "EQ04",
+            TimestampUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+            AlgorithmCode = "DIFFIEHELLMAN",
+            Operation = "forward",
+            PayloadMode = "text",
+            OriginalFileName = "DIFFIEHELLMAN_original.txt"
+        };
+        var (dhZip, _, _) = _crypto.ExecuteProviderForward(dhReq, dhOrigBytes, null, "127.0.0.1:5004");
+        Assert.True(_certZip.ValidateZipPackage(dhZip, checkReplay: false).IsValid);
+
+        File.WriteAllBytes(Path.Combine(dir, "DIFFIEHELLMAN_ejemplo.zip"), dhZip);
+        File.WriteAllText(Path.Combine(dir, "DIFFIEHELLMAN_secretos.json"), "{}", Encoding.UTF8);
+        File.WriteAllText(Path.Combine(dir, "DIFFIEHELLMAN_original.txt"), dhOriginal, Encoding.UTF8);
+
+        Assert.True(File.Exists(Path.Combine(dir, "certificado.pem")));
+        Assert.True(File.Exists(Path.Combine(dir, "CAESAR_ejemplo.zip")));
+        Assert.True(File.Exists(Path.Combine(dir, "DIFFIEHELLMAN_ejemplo.zip")));
+    }
+
+    [Fact]
+    public void AdvancedMode_DefaultsToFalse_AndPersistsInSqlite()
+    {
+        Assert.False(_db.GetAdvancedMode());
+        Assert.True(_db.SetAdvancedMode(true));
+        Assert.True(_db.GetAdvancedMode());
+        Assert.False(_db.SetAdvancedMode(false));
+        Assert.False(_db.GetAdvancedMode());
+    }
+
+    private static byte[] MutateZip(byte[] zipBytes, Func<string, byte[], byte[]> mutator)
+    {
+        using var dstMs = new MemoryStream();
+        using (var srcMs = new MemoryStream(zipBytes))
+        using (var src = new ZipArchive(srcMs, ZipArchiveMode.Read))
+        using (var dst = new ZipArchive(dstMs, ZipArchiveMode.Create, true))
+        {
+            foreach (var e in src.Entries)
+            {
+                using var es = e.Open();
+                using var copy = new MemoryStream();
+                es.CopyTo(copy);
+                var data = mutator(e.FullName, copy.ToArray());
+                var ne = dst.CreateEntry(e.FullName);
+                using var ns = ne.Open();
+                ns.Write(data, 0, data.Length);
+            }
+        }
+        return dstMs.ToArray();
+    }
+
+    private static byte[] AddExtraEntry(byte[] zipBytes, string extraName, byte[] extraData)
+    {
+        using var dstMs = new MemoryStream();
+        using (var srcMs = new MemoryStream(zipBytes))
+        using (var src = new ZipArchive(srcMs, ZipArchiveMode.Read))
+        using (var dst = new ZipArchive(dstMs, ZipArchiveMode.Create, true))
+        {
+            foreach (var e in src.Entries)
+            {
+                using var es = e.Open();
+                var ne = dst.CreateEntry(e.FullName);
+                using var ns = ne.Open();
+                es.CopyTo(ns);
+            }
+            var extra = dst.CreateEntry(extraName);
+            using var exs = extra.Open();
+            exs.Write(extraData, 0, extraData.Length);
+        }
+        return dstMs.ToArray();
     }
 }

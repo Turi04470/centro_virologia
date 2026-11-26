@@ -7,14 +7,17 @@
   const state = {
     action: "encrypt",
     mode: "text",
+    advancedMode: false,
     algorithms: [],
     consultas: [],
     consultasFilter: "all",
     consultasLayout: localStorage.getItem(STORAGE_CONSULTAS_VIEW) || "table",
     requests: [],
+    nodes: [],
     drawerItem: null,
+    sourceConsultaId: null,
     lastInspector: {
-      algo: "AES-256-GCM",
+      algo: "CAESAR",
       cells: Array.from({ length: 16 }, (_, i) => i.toString(16).padStart(2, "0").toUpperCase()),
       steps: ["Esperando operación"]
     },
@@ -32,9 +35,11 @@
   async function api(url, options = {}) {
     const resp = await fetch(url, options);
     const contentType = resp.headers.get("content-type") || "";
-    const data = contentType.includes("application/json") ? await resp.json() : null;
+    const data = (contentType.includes("application/json") || contentType.includes("application/problem+json"))
+      ? await resp.json()
+      : null;
     if (!resp.ok) {
-      throw new Error(data?.error || `HTTP ${resp.status}`);
+      throw new Error(data?.detail || data?.error || data?.title || `HTTP ${resp.status}`);
     }
     return data;
   }
@@ -67,6 +72,7 @@
         $(`#view-${target}`).classList.add("active");
         if (target === "consultas") refreshConsultas();
         if (target === "solicitudes") refreshRequests();
+        if (target === "nodos") refreshNodes();
       });
     });
   }
@@ -78,8 +84,20 @@
     syncVisibleAlgorithms();
   }
 
+  function hasOnlineTrustedProvider(algo) {
+    const trustedOnline = state.nodes.filter(
+      (n) => n.status === "online" && Boolean(n.pinnedThumbprintSha256) && !n.trustAlert
+    );
+    if (algo.ownerNode && trustedOnline.some((n) => n.nodeId === algo.ownerNode)) return true;
+    return trustedOnline.some((n) => (n.algorithms || []).includes(algo.code));
+  }
+
   function syncVisibleAlgorithms() {
-    const visible = state.algorithms.filter((a) => a.isVisible);
+    const visible = state.algorithms.filter((a) => {
+      if (!a.isVisible) return false;
+      if (state.advancedMode) return true;
+      return a.ownerNode === "EQ04" || hasOnlineTrustedProvider(a);
+    });
     const sel = $("#algoSelect");
     const prev = sel.value;
     sel.innerHTML = "";
@@ -87,7 +105,8 @@
     visible.forEach((a) => {
       const opt = document.createElement("option");
       opt.value = a.code;
-      opt.textContent = a.name;
+      const tag = a.ownerNode === "EQ04" ? "" : (hasOnlineTrustedProvider(a) ? ` (${a.ownerNode || "Remoto"})` : " (Local)");
+      opt.textContent = a.name + tag;
       sel.appendChild(opt);
     });
 
@@ -114,15 +133,21 @@
   // --- Settings ---
   function initSettings() {
     $("#settingsSearch").addEventListener("input", (e) => renderSettings(e.target.value));
-    $$(".preset-btn").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        if (btn.dataset.preset === "hideAll") {
-          state.algorithms = await api("/api/config/algorithms/hide-all", { method: "POST" });
-          renderSettings($("#settingsSearch").value);
-          syncVisibleAlgorithms();
-          toast("Algoritmos ocultos");
-        }
-      });
+    $("#advancedModeToggle").addEventListener("change", async (e) => {
+      try {
+        const res = await api("/api/config/advanced-mode", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: e.target.checked })
+        });
+        state.advancedMode = Boolean(res.advancedMode);
+        renderSettings($("#settingsSearch").value);
+        syncVisibleAlgorithms();
+        toast(state.advancedMode ? "Modo avanzado activado (21 algoritmos)" : "Modo EQ04 activado");
+      } catch (err) {
+        e.target.checked = state.advancedMode;
+        toast(err.message);
+      }
     });
   }
 
@@ -132,6 +157,7 @@
     body.innerHTML = "";
 
     state.algorithms
+      .filter((a) => state.advancedMode || a.ownerNode === "EQ04")
       .filter((a) => !q || a.name.toLowerCase().includes(q) || a.category.toLowerCase().includes(q) || a.code.toLowerCase().includes(q))
       .forEach((algo) => {
         const tr = document.createElement("tr");
@@ -322,6 +348,7 @@
     state.fileName = "";
     state.fileSize = 0;
     state.lastResponse = null;
+    state.sourceConsultaId = null;
     state.lsbHasOutputImage = false;
     $("#fileName").textContent = "Archivo";
     $("#fileInfo").textContent = "—";
@@ -350,7 +377,8 @@
       fileBase64: state.mode === "file" ? state.fileBase64 : null,
       fileName: state.mode === "file" ? state.fileName : "mensaje.txt",
       key: $("#keyInput").value.trim(),
-      attachCertificate: $("#attachCertToggle").checked
+      attachCertificate: $("#attachCertToggle").checked,
+      sourceConsultaId: isEncrypt ? null : state.sourceConsultaId
     };
 
     try {
@@ -560,15 +588,22 @@
     $("#drawerCloseBtn").addEventListener("click", closeSendDrawer);
     $("#drawerCancelBtn").addEventListener("click", closeSendDrawer);
     $("#sendDrawerBackdrop").addEventListener("click", closeSendDrawer);
+    $("#drawerNodeSelect").addEventListener("change", (e) => {
+      const node = state.nodes.find((n) => n.nodeId === e.target.value);
+      if (node) $("#drawerTargetIp").value = `${node.ip}:${node.httpPort}`;
+    });
+
     $("#drawerSendBtn").addEventListener("click", async () => {
+      const targetNodeId = $("#drawerNodeSelect").value || null;
       const targetIp = $("#drawerTargetIp").value.trim();
-      if (!targetIp || !state.drawerItem) return toast("Ingresa IP:Puerto");
+      if (!targetIp && !targetNodeId) return toast("Selecciona un nodo o ingresa IP:Puerto");
+      if (!state.drawerItem) return;
       try {
         $("#drawerSendBtn").disabled = true;
         const res = await api(`/api/consultas/${state.drawerItem.id}/send`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ targetIp })
+          body: JSON.stringify({ targetIp, targetNodeId })
         });
         closeSendDrawer();
         toast(`Enviado a ${res.targetUrl}`);
@@ -723,6 +758,7 @@
         $("#inputText").value = pkg.dataText;
       }
 
+      state.sourceConsultaId = id;
       showInputState();
       updateInputMeta();
       toast("Cargado en Operar");
@@ -736,9 +772,22 @@
     $("#drawerFileName").textContent = item.zipFileName;
     $("#drawerAlgo").textContent = item.algorithmName;
     $("#drawerSha").textContent = `${item.encryptedSha256.slice(0, 18)}…`;
+    syncDrawerNodeSelect();
     $("#sendDrawerBackdrop").classList.add("open");
     $("#sendDrawer").classList.add("open");
     $("#sendDrawer").setAttribute("aria-hidden", "false");
+  }
+
+  function syncDrawerNodeSelect() {
+    const sel = $("#drawerNodeSelect");
+    if (!sel) return;
+    sel.innerHTML = `<option value="">Seleccionar nodo del directorio...</option>`;
+    state.nodes.forEach((n) => {
+      const opt = document.createElement("option");
+      opt.value = n.nodeId;
+      opt.textContent = `${n.nodeId} (${n.ip}:${n.httpPort}) · ${n.status}`;
+      sel.appendChild(opt);
+    });
   }
 
   function closeSendDrawer() {
@@ -776,15 +825,17 @@
     state.requests.forEach((req) => {
       const tr = document.createElement("tr");
       const statusCls = req.status === "Aceptada" ? "badge-ok" : (req.status === "Rechazada" ? "badge-err" : "badge-pending");
+      const trustCls = req.trustStatus === "Firma OK" ? "badge-ok" : (req.trustStatus === "Remitente no confirmado" ? "badge-pending" : "badge-err");
       const actionsHtml = req.status === "Pendiente"
         ? `<button class="btn-solid req-accept" data-id="${req.id}" style="height:28px; padding:0 12px; font-size:12px;">Aceptar</button>
            <button class="btn-chip req-reject" data-id="${req.id}" style="height:28px; padding:0 12px; font-size:12px;">Rechazar</button>`
         : `<span class="meta-count">—</span>`;
       tr.innerHTML = `
-        <td class="input-mono">${req.sourceIp}</td>
+        <td class="input-mono" style="font-size:12px;"><strong>${req.sourceNode || "—"}</strong><br><span class="meta-count">${req.sourceIp}</span></td>
         <td class="input-mono" style="font-size:12px;">${req.zipFileName}</td>
         <td>${req.algorithmName}</td>
-        <td><span class="${req.signatureValid ? "badge-ok" : "badge-err"}">${req.signatureValid ? "X.509 OK" : "Inválida"}</span></td>
+        <td><span class="cat-pill">${req.operationName || "cifrar"}</span></td>
+        <td><span class="${trustCls}">${req.trustStatus || "Firma OK"}</span></td>
         <td><span class="${statusCls}">${req.status}</span></td>
         <td class="td-center"><div class="tool-bottom-group" style="justify-content:center;">${actionsHtml}</div></td>
       `;
@@ -810,6 +861,116 @@
           await api(`/api/requests/${btn.dataset.id}/reject`, { method: "POST" });
           await refreshRequests();
           toast("Solicitud rechazada");
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+    });
+  }
+
+  // --- Nodos (Directorio LAN + TOFU v2.0) ---
+  function initNodes() {
+    $("#addManualNodeBtn").addEventListener("click", async () => {
+      const ip = $("#manualNodeIp").value.trim();
+      const port = parseInt($("#manualNodePort").value, 10);
+      if (!ip || !port) return toast("Ingresa IP y puerto");
+      try {
+        $("#addManualNodeBtn").disabled = true;
+        await api("/api/nodes/manual", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ip, port })
+        });
+        await refreshNodes();
+        toast("Nodo agregado (confirma huella TOFU)");
+      } catch (err) {
+        toast(err.message);
+      } finally {
+        $("#addManualNodeBtn").disabled = false;
+      }
+    });
+
+    $("#scanNodesBtn").addEventListener("click", async () => {
+      try {
+        $("#scanNodesBtn").disabled = true;
+        $("#scanNodesBtn").textContent = "Buscando...";
+        const res = await api("/api/nodes/scan", { method: "POST" });
+        await refreshNodes();
+        toast(`Escaneo listo: ${res.foundCount} nodo(s)`);
+      } catch (err) {
+        toast(err.message);
+      } finally {
+        $("#scanNodesBtn").disabled = false;
+        $("#scanNodesBtn").textContent = "Buscar nodos";
+      }
+    });
+  }
+
+  async function refreshNodes() {
+    state.nodes = await api("/api/nodes");
+    renderNodes();
+    syncDrawerNodeSelect();
+    syncVisibleAlgorithms();
+  }
+
+  function renderNodes() {
+    const body = $("#nodesBody");
+    if (!body) return;
+    body.innerHTML = "";
+
+    state.nodes.forEach((n) => {
+      const tr = document.createElement("tr");
+      const statusCls = n.status === "online" ? "badge-ok" : "badge-err";
+      const isPinned = Boolean(n.pinnedThumbprintSha256) && !n.trustAlert;
+      const trustBadge = n.trustAlert
+        ? `<span class="badge-err">¡Huella cambió!</span>`
+        : (isPinned ? `<span class="badge-ok">Fijada</span>` : `<span class="badge-pending">Sin confirmar</span>`);
+      const confirmBtn = (!isPinned || n.trustAlert)
+        ? `<button class="btn-solid n-confirm" data-id="${n.nodeId}" style="height:28px; padding:0 12px; font-size:12px;">Confirmar</button>`
+        : "";
+
+      tr.innerHTML = `
+        <td class="input-mono"><strong>${n.nodeId}</strong></td>
+        <td class="input-mono" style="font-size:12px;">${n.ip}:${n.httpPort}</td>
+        <td>${(n.algorithms || []).map((a) => `<span class="cat-pill" style="margin-right:4px;">${a}</span>`).join("") || "—"}</td>
+        <td class="input-mono" style="font-size:11.5px;">${(n.announcedThumbprintSha256 || "").slice(0, 14)}…</td>
+        <td><span class="${statusCls}">${n.status}</span></td>
+        <td>${trustBadge}</td>
+        <td class="td-center">
+          <div class="tool-bottom-group" style="justify-content:center; gap:6px;">
+            ${confirmBtn}
+            <button class="icon-action-btn icon-action-danger n-delete" data-id="${n.nodeId}" title="Eliminar" aria-label="Eliminar">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3 6 5 6 21 6"></polyline>
+                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+                <path d="M10 11v6"></path>
+                <path d="M14 11v6"></path>
+              </svg>
+            </button>
+          </div>
+        </td>
+      `;
+      body.appendChild(tr);
+    });
+
+    body.querySelectorAll(".n-confirm").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          await api(`/api/nodes/${encodeURIComponent(btn.dataset.id)}/confirm`, { method: "POST" });
+          await refreshNodes();
+          toast(`Huella de ${btn.dataset.id} fijada`);
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+    });
+
+    body.querySelectorAll(".n-delete").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          await api(`/api/nodes/${encodeURIComponent(btn.dataset.id)}`, { method: "DELETE" });
+          await refreshNodes();
+          toast("Nodo eliminado");
         } catch (err) {
           toast(err.message);
         }
@@ -847,9 +1008,21 @@
     initInspector();
     initConsultas();
     initRequests();
+    initNodes();
     initSettings();
     try {
-      await Promise.all([refreshAlgorithms(), refreshConsultas(), refreshRequests()]);
+      const [, , , , advRes] = await Promise.all([
+        refreshAlgorithms(),
+        refreshConsultas(),
+        refreshRequests(),
+        refreshNodes(),
+        api("/api/config/advanced-mode")
+      ]);
+      state.advancedMode = Boolean(advRes?.advancedMode);
+      const advEl = $("#advancedModeToggle");
+      if (advEl) advEl.checked = state.advancedMode;
+      renderSettings($("#settingsSearch")?.value || "");
+      syncVisibleAlgorithms();
     } catch (err) {
       toast(err.message);
     }

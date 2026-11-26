@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NODO-04 // Cripto</title>
+  <title>EQ04 // Cripto v2.0</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <div class="brand-mark"></div>
-      <span class="brand-id">NODO-04</span>
+      <span class="brand-id">EQ04</span>
     </div>
 
     <nav class="nav-links" role="tablist">
@@ -18,11 +18,12 @@
       <button class="nav-tab" data-view="inspector" role="tab">Inspector</button>
       <button class="nav-tab" data-view="consultas" role="tab">Consultas</button>
       <button class="nav-tab" data-view="solicitudes" role="tab">Solicitudes <span id="reqCountBadge" class="req-badge hidden">0</span></button>
+      <button class="nav-tab" data-view="nodos" role="tab">Nodos</button>
       <button class="nav-tab" data-view="ajustes" role="tab">Ajustes</button>
     </nav>
 
     <div class="topbar-right">
-      <span class="pill-chip"><span class="dot-live"></span>LAN</span>
+      <span class="pill-chip"><span class="dot-live"></span>LAN :5004</span>
       <button id="themeToggle" class="icon-circle-btn" title="Tema" aria-label="Cambiar tema">
         <svg id="iconSun" class="hidden" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="12" cy="12" r="4"></circle>
@@ -184,8 +185,9 @@
             <input id="consultasSearch" type="text" class="input-pill" placeholder="Buscar..." />
             <div class="segmented-pills" id="consultasFilterGroup">
               <button class="seg-pill active" data-origin="all">Todos</button>
-              <button class="seg-pill" data-origin="Local">Local</button>
+              <button class="seg-pill" data-origin="Generado">Generado</button>
               <button class="seg-pill" data-origin="Recibido">Recibido</button>
+              <button class="seg-pill" data-origin="Resultado">Resultado</button>
             </div>
           </div>
           <div class="tool-bottom-group">
@@ -243,10 +245,11 @@
           <table>
             <thead>
               <tr>
-                <th>Origen IP</th>
+                <th>Nodo / IP</th>
                 <th>Archivo (.ZIP)</th>
                 <th>Algoritmo</th>
-                <th>Firma</th>
+                <th>Operación</th>
+                <th>Validación</th>
                 <th>Estado</th>
                 <th class="td-center">Acción</th>
               </tr>
@@ -257,13 +260,52 @@
       </div>
     </section>
 
-    <!-- 5. AJUSTES -->
+    <!-- 5. NODOS (Directorio LAN + TOFU v2.0) -->
+    <section id="view-nodos" class="view">
+      <div class="card-plain">
+        <div class="card-head" style="flex-wrap: wrap; gap: 10px;">
+          <div class="tool-bottom-group">
+            <input id="manualNodeIp" type="text" class="input-pill" placeholder="IP (ej. 192.168.1.20)" style="width: 185px; font-family: var(--font-mono); font-size: 12px;" />
+            <input id="manualNodePort" type="number" class="input-pill" value="5001" placeholder="Puerto" style="width: 96px; font-family: var(--font-mono); font-size: 12px;" />
+            <button id="addManualNodeBtn" class="btn-solid" style="height: 36px; padding: 0 16px;">Agregar</button>
+          </div>
+          <div class="tool-bottom-group">
+            <button id="scanNodesBtn" class="btn-chip">Buscar nodos</button>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Nodo</th>
+                <th>IP:Puerto</th>
+                <th>Algoritmos</th>
+                <th>Huella SHA-256</th>
+                <th>Estado</th>
+                <th>Confianza</th>
+                <th class="td-center">Acción</th>
+              </tr>
+            </thead>
+            <tbody id="nodesBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 6. AJUSTES -->
     <section id="view-ajustes" class="view">
       <div class="card-plain">
         <div class="card-head" style="flex-wrap: wrap; gap: 10px;">
           <input id="settingsSearch" type="text" class="input-pill" placeholder="Buscar..." />
           <div class="tool-bottom-group">
-            <button class="btn-chip preset-btn" data-preset="hideAll">Ocultar Todos</button>
+            <label class="switch-wrap">
+              <span class="switch">
+                <input id="advancedModeToggle" type="checkbox" />
+                <span class="slider"></span>
+              </span>
+              <span>Modo avanzado</span>
+            </label>
           </div>
         </div>
 
@@ -308,7 +350,10 @@
         </div>
       </div>
 
-      <input id="drawerTargetIp" type="text" class="input-pill" value="192.168.1.25:5000" style="width:100%; font-family:var(--font-mono);" placeholder="IP:Puerto destino" />
+      <select id="drawerNodeSelect" class="input-pill" style="width:100%;">
+        <option value="">Seleccionar nodo del directorio...</option>
+      </select>
+      <input id="drawerTargetIp" type="text" class="input-pill" value="192.168.1.25:5001" style="width:100%; font-family:var(--font-mono);" placeholder="O escribir IP:Puerto destino" />
     </div>
     <div class="drawer-foot">
       <button id="drawerCancelBtn" class="btn-chip">Cancelar</button>

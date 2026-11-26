@@ -25,8 +25,8 @@ dotnet run --project src\CentroCiberseguridad.Web
 ```
 
 Luego abre en tu navegador:
-- Local: `http://localhost:5000`
-- Red LAN: `http://<tu-IP>:5000`
+- Local: `http://localhost:5004`
+- Red LAN: `http://<tu-IP>:5004`
 
 ## Ejecutar pruebas
 
@@ -36,10 +36,10 @@ dotnet test -c Release
 
 ## Publicar (versión autocontenida `win-x64`)
 
-Se generará dentro de la carpeta `Proyecto\publicado`:
+Se generará dentro de la carpeta `Proyecto\Centro virologia V`:
 
 ```powershell
-dotnet publish "src\CentroCiberseguridad.Web\CentroCiberseguridad.Web.csproj" -c Release -r win-x64 --self-contained true -o "publicado"
+dotnet publish "src\CentroCiberseguridad.Web\CentroCiberseguridad.Web.csproj" -c Release -r win-x64 --self-contained true -o "Centro virologia V2.0"
 ```
 
 Para ejecutarlo en otra PC con Windows (sin instalar `.NET` ni `SQLite`), copia la carpeta `publicado`, haz doble clic en `CentroCiberseguridad.Web.exe` y abre `http://localhost:5000` en el navegador.

@@ -74,11 +74,13 @@ public sealed class CryptoEngineService
             var origName = string.IsNullOrWhiteSpace(req.FileName) ? (isFile ? "archivo.bin" : "mensaje.txt") : req.FileName!;
             var (zipBytes, zName, mf) = _certZip.CreateSignedZipPackage(
                 outBytes,
-                algo.Code,
-                algo.Name,
-                req.InputMode,
-                origName,
-                inputBytes.Length,
+                algo,
+                packetType: "package",
+                operation: "forward",
+                payloadMode: isFile ? "file" : "text",
+                originalFileName: origName,
+                originalSizeBytes: inputBytes.Length,
+                contentType: isFile ? "application/octet-stream" : "text/plain",
                 publicParams: pubParams);
 
             zipFileName = zName;
@@ -86,8 +88,11 @@ public sealed class CryptoEngineService
             consultaId = _db.AddSavedPackage(new SavedPackageRecord
             {
                 ZipFileName = zName,
-                Origin = "Local",
-                SourceIp = "127.0.0.1",
+                Origin = "Generado",
+                SourceNode = SqliteDatabaseService.LocalNodeId,
+                ProducerNode = SqliteDatabaseService.LocalNodeId,
+                SourceIp = $"127.0.0.1:{SqliteDatabaseService.LocalHttpPort}",
+                PacketType = "package",
                 AlgorithmCode = algo.Code,
                 AlgorithmName = algo.Name,
                 EncryptedSha256 = outSha,
@@ -110,6 +115,8 @@ public sealed class CryptoEngineService
             AlgorithmCode = algo.Code,
             AlgorithmName = algo.Name,
             IsEncrypt = req.IsEncrypt,
+            ExecutionMode = "local",
+            ProducerNode = SqliteDatabaseService.LocalNodeId,
             OutputText = outText,
             OutputBase64 = Convert.ToBase64String(outBytes),
             OutputFileName = string.IsNullOrWhiteSpace(outFileName) ? "descifrado.bin" : outFileName,
@@ -120,6 +127,272 @@ public sealed class CryptoEngineService
             Steps = steps,
             Manifest = manifest
         };
+    }
+
+    // --- Proveedor v2.0: POST /api/crypto/forward (EQ04: CAESAR y DIFFIEHELLMAN) ---
+    public (byte[] ZipBytes, string ZipFileName, SignedManifest Manifest) ExecuteProviderForward(
+        CryptoRemoteRequestDto remoteReq,
+        byte[] payloadBytes,
+        Dictionary<string, string>? secrets,
+        string localIpWithPort)
+    {
+        var code = remoteReq.AlgorithmCode.ToUpperInvariant();
+        if (!SqliteDatabaseService.OwnedAlgorithmCodes.Contains(code))
+            throw new ProtocolException("E-ALGORITHM-NOT-PROVIDED", 404, "Algoritmo no provisto", $"EQ04 no provee el algoritmo '{code}'.");
+
+        var algo = _db.GetAlgorithm(code)
+            ?? throw new ProtocolException("E-ALGORITHM", 400, "Algoritmo inválido", $"Algoritmo desconocido: '{code}'.");
+
+        if (!algo.IsVisible || !algo.CanEncrypt)
+            throw new ProtocolException("E-BUSY", 503, "Algoritmo deshabilitado", $"El algoritmo '{code}' está deshabilitado en este nodo.");
+
+        var packetId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+        var pubParams = new Dictionary<string, string>();
+        KeyRefInfo? keyRef = null;
+        byte[] encryptedBytes;
+
+        if (code == "CAESAR")
+        {
+            if (secrets is null || !secrets.TryGetValue("shift", out var shiftStr) || !int.TryParse(shiftStr, out var shift))
+                throw new ProtocolException("E-PARAMS", 400, "Parámetros inválidos", "CAESAR requiere secreto entero 'shift'.");
+
+            var alphabet = remoteReq.Options.TryGetValue("alphabet", out var alp) && alp is ("A-Z" or "BYTE")
+                ? alp
+                : (remoteReq.PayloadMode == "text" ? "A-Z" : "BYTE");
+
+            pubParams["alphabet"] = alphabet;
+            if (alphabet == "A-Z")
+            {
+                var txt = Encoding.UTF8.GetString(payloadBytes);
+                var shifted = txt.Select(c =>
+                {
+                    if (c is >= 'A' and <= 'Z') return (char)(((c - 'A' + shift) % 26 + 26) % 26 + 'A');
+                    if (c is >= 'a' and <= 'z') return (char)(((c - 'a' + shift) % 26 + 26) % 26 + 'a');
+                    return c;
+                }).ToArray();
+                encryptedBytes = Encoding.UTF8.GetBytes(new string(shifted));
+            }
+            else
+            {
+                encryptedBytes = payloadBytes.Select(b => (byte)(((b + shift) % 256 + 256) % 256)).ToArray();
+            }
+        }
+        else // DIFFIEHELLMAN con keyId (Sección 4.2 y 12)
+        {
+            var keyRecord = GetOrCreateDhKey(remoteReq.KeyId, remoteReq.RequesterNode, remoteReq.Options);
+            using var pubDoc = JsonDocument.Parse(keyRecord.PublicParamsJson);
+            using var privDoc = JsonDocument.Parse(keyRecord.PrivateParamsJson);
+
+            var pBytes = Convert.FromBase64String(pubDoc.RootElement.GetProperty("pBase64").GetString()!);
+            var p = new BigInteger(pBytes, isUnsigned: true, isBigEndian: true);
+            var g = BigInteger.Parse(pubDoc.RootElement.GetProperty("g").GetString()!);
+            var bPub = new BigInteger(Convert.FromBase64String(pubDoc.RootElement.GetProperty("publicValueBase64").GetString()!), isUnsigned: true, isBigEndian: true);
+
+            // Efímero del forward (a)
+            var aBytes = RandomNumberGenerator.GetBytes(32);
+            var a = new BigInteger(aBytes, isUnsigned: true, isBigEndian: true) % (p - 2) + 2;
+            var aPub = BigInteger.ModPow(g, a, p);
+            var shared = BigInteger.ModPow(bPub, a, p);
+
+            var symKey = SHA256.HashData(shared.ToByteArray(isUnsigned: true, isBigEndian: true));
+            var nonce = RandomNumberGenerator.GetBytes(12);
+            var cipher = new byte[payloadBytes.Length];
+            var tag = new byte[16];
+            var aad = Encoding.UTF8.GetBytes(packetId);
+            using (var aes = new AesGcm(symKey, 16))
+                aes.Encrypt(nonce, payloadBytes, cipher, tag, aad);
+            CryptographicOperations.ZeroMemory(symKey);
+
+            encryptedBytes = cipher;
+            keyRef = new KeyRefInfo { KeyId = keyRecord.KeyId, OwnerNode = SqliteDatabaseService.LocalNodeId };
+            pubParams["keyId"] = keyRecord.KeyId;
+            pubParams["pBase64"] = Convert.ToBase64String(pBytes);
+            pubParams["g"] = g.ToString();
+            pubParams["publicValueBase64"] = Convert.ToBase64String(aPub.ToByteArray(isUnsigned: true, isBigEndian: true));
+            pubParams["kdf"] = "SHA-256";
+            pubParams["nonceBase64"] = Convert.ToBase64String(nonce);
+            pubParams["tagBase64"] = Convert.ToBase64String(tag);
+        }
+
+        var origName = string.IsNullOrWhiteSpace(remoteReq.OriginalFileName) ? "mensaje.txt" : remoteReq.OriginalFileName;
+        return _certZip.CreateSignedZipPackage(
+            encryptedBytes,
+            algo,
+            packetType: "package",
+            operation: "forward",
+            payloadMode: remoteReq.PayloadMode,
+            originalFileName: origName,
+            originalSizeBytes: payloadBytes.Length,
+            contentType: remoteReq.PayloadMode == "text" ? "text/plain" : "application/octet-stream",
+            requestId: remoteReq.RequestId,
+            producerNode: SqliteDatabaseService.LocalNodeId,
+            sourceIp: localIpWithPort,
+            publicParams: pubParams,
+            keyRef: keyRef,
+            explicitPacketId: packetId);
+    }
+
+    // --- Proveedor v2.0: POST /api/crypto/inverse (EQ04: CAESAR y DIFFIEHELLMAN) ---
+    public (byte[] ZipBytes, string ZipFileName, SignedManifest Manifest) ExecuteProviderInverse(
+        CryptoRemoteRequestDto remoteReq,
+        ZipValidationResult packageVal,
+        Dictionary<string, string>? secrets,
+        string requesterCertPem,
+        string localIpWithPort)
+    {
+        var mf = packageVal.Manifest!;
+        var code = mf.AlgorithmCode.ToUpperInvariant();
+        if (!SqliteDatabaseService.OwnedAlgorithmCodes.Contains(code))
+            throw new ProtocolException("E-ALGORITHM-NOT-PROVIDED", 404, "Algoritmo no provisto", $"EQ04 no provee el algoritmo '{code}'.");
+
+        var algo = _db.GetAlgorithm(code)
+            ?? throw new ProtocolException("E-ALGORITHM", 400, "Algoritmo inválido", $"Algoritmo desconocido: '{code}'.");
+
+        if (!algo.IsVisible || !algo.CanDecrypt)
+            throw new ProtocolException("E-BUSY", 503, "Algoritmo deshabilitado", $"La operación inversa de '{code}' está deshabilitada en este nodo.");
+
+        byte[] plainBytes;
+        if (code == "CAESAR")
+        {
+            if (secrets is null || !secrets.TryGetValue("shift", out var shiftStr) || !int.TryParse(shiftStr, out var shift))
+                throw new ProtocolException("E-PARAMS", 400, "Parámetros inválidos", "CAESAR requiere secreto entero 'shift'.");
+
+            var alphabet = mf.PublicParameters.TryGetValue("alphabet", out var alp) ? alp : "BYTE";
+            if (alphabet == "A-Z")
+            {
+                var txt = Encoding.UTF8.GetString(packageVal.PayloadBytes);
+                var unshifted = txt.Select(c =>
+                {
+                    if (c is >= 'A' and <= 'Z') return (char)(((c - 'A' - shift) % 26 + 26) % 26 + 'A');
+                    if (c is >= 'a' and <= 'z') return (char)(((c - 'a' - shift) % 26 + 26) % 26 + 'a');
+                    return c;
+                }).ToArray();
+                plainBytes = Encoding.UTF8.GetBytes(new string(unshifted));
+            }
+            else
+            {
+                plainBytes = packageVal.PayloadBytes.Select(b => (byte)(((b - shift) % 256 + 256) % 256)).ToArray();
+            }
+        }
+        else // DIFFIEHELLMAN
+        {
+            var keyId = mf.KeyRef?.KeyId ?? (mf.PublicParameters.TryGetValue("keyId", out var kId) ? kId : null);
+            if (string.IsNullOrWhiteSpace(keyId))
+                throw new ProtocolException("E-PARAMS", 400, "keyId faltante", "El manifiesto de DIFFIEHELLMAN no contiene keyId.");
+
+            var keyRec = _db.GetAsymmetricKey(keyId)
+                ?? throw new ProtocolException("E-KEY-NOT-FOUND", 404, "Llave no encontrada", $"keyId '{keyId}' desconocido.");
+
+            if (!string.IsNullOrWhiteSpace(keyRec.AllowedNodes))
+            {
+                var allowed = keyRec.AllowedNodes.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                if (!allowed.Contains(remoteReq.RequesterNode, StringComparer.Ordinal))
+                    throw new ProtocolException("E-KEY-FORBIDDEN", 403, "Acceso denegado a llave", $"El nodo '{remoteReq.RequesterNode}' no tiene permiso para usar '{keyId}'.");
+            }
+
+            using var pubDoc = JsonDocument.Parse(keyRec.PublicParamsJson);
+            using var privDoc = JsonDocument.Parse(keyRec.PrivateParamsJson);
+            var p = new BigInteger(Convert.FromBase64String(pubDoc.RootElement.GetProperty("pBase64").GetString()!), isUnsigned: true, isBigEndian: true);
+            var bPriv = new BigInteger(Convert.FromBase64String(privDoc.RootElement.GetProperty("privateExponentBase64").GetString()!), isUnsigned: true, isBigEndian: true);
+
+            var aPub = new BigInteger(Convert.FromBase64String(mf.PublicParameters["publicValueBase64"]), isUnsigned: true, isBigEndian: true);
+            var nonce = Convert.FromBase64String(mf.PublicParameters["nonceBase64"]);
+            var tag = Convert.FromBase64String(mf.PublicParameters["tagBase64"]);
+            var shared = BigInteger.ModPow(aPub, bPriv, p);
+            var symKey = SHA256.HashData(shared.ToByteArray(isUnsigned: true, isBigEndian: true));
+
+            plainBytes = new byte[packageVal.PayloadBytes.Length];
+            var aad = Encoding.UTF8.GetBytes(mf.PacketId);
+            try
+            {
+                using var aes = new AesGcm(symKey, 16);
+                aes.Decrypt(nonce, packageVal.PayloadBytes, tag, plainBytes, aad);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(symKey);
+            }
+        }
+
+        // Envolver resultado con CC-ENV-1 para el solicitante (Sección 8.3 y 10.6)
+        var resultPacketId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+        var (resultEnv, resultCipherBytes) = CertificateAndZipService.WrapEnvelope(
+            plainBytes,
+            remoteReq.RequesterNode,
+            requesterCertPem,
+            resultPacketId,
+            includeCiphertextInJson: false);
+
+        return _certZip.CreateSignedZipPackage(
+            resultCipherBytes,
+            algo,
+            packetType: "result",
+            operation: "inverse",
+            payloadMode: mf.PayloadMode,
+            originalFileName: mf.OriginalFileName,
+            originalSizeBytes: plainBytes.Length,
+            contentType: mf.ContentType,
+            requestId: remoteReq.RequestId,
+            producerNode: SqliteDatabaseService.LocalNodeId,
+            sourceIp: localIpWithPort,
+            publicParams: new Dictionary<string, string>(),
+            keyRef: mf.KeyRef,
+            resultEnvelope: resultEnv,
+            explicitPacketId: resultPacketId);
+    }
+
+    private AsymmetricKeyRecord GetOrCreateDhKey(string? requestedKeyId, string requesterNode, Dictionary<string, string> options)
+    {
+        if (!string.IsNullOrWhiteSpace(requestedKeyId))
+        {
+            var existing = _db.GetAsymmetricKey(requestedKeyId)
+                ?? throw new ProtocolException("E-KEY-NOT-FOUND", 404, "Llave no encontrada", $"keyId '{requestedKeyId}' desconocido.");
+
+            if (!string.IsNullOrWhiteSpace(existing.AllowedNodes))
+            {
+                var allowed = existing.AllowedNodes.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                if (!allowed.Contains(requesterNode, StringComparer.Ordinal))
+                    throw new ProtocolException("E-KEY-FORBIDDEN", 403, "Acceso denegado a llave", $"El nodo '{requesterNode}' no puede reutilizar '{requestedKeyId}'.");
+            }
+            return existing;
+        }
+
+        // Primo seguro RFC 3526 grupo 14 (2048-bit MODP) simplificado o 1024-bit seguro para rapidez en demo
+        // Usamos el primo seguro estándar de 256 bits para operación rápida y sin desbordes
+        var p = BigInteger.Parse("00fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f", System.Globalization.NumberStyles.HexNumber);
+        var g = new BigInteger(2);
+        var bBytes = RandomNumberGenerator.GetBytes(32);
+        var b = new BigInteger(bBytes, isUnsigned: true, isBigEndian: true) % (p - 2) + 2;
+        var bPub = BigInteger.ModPow(g, b, p);
+
+        var keyId = $"{SqliteDatabaseService.LocalNodeId}-KEY-{Guid.NewGuid():D}".ToLowerInvariant();
+        // NodeId debe ir en mayúsculas (EQ04-KEY-<uuid>) según sección 3: ^EQ[0-9]{2}-KEY-[0-9a-f-]{36}$
+        keyId = $"{SqliteDatabaseService.LocalNodeId}-KEY-{Guid.NewGuid().ToString("D").ToLowerInvariant()}";
+
+        var pubJson = JsonSerializer.Serialize(new
+        {
+            pBase64 = Convert.ToBase64String(p.ToByteArray(isUnsigned: true, isBigEndian: true)),
+            g = g.ToString(),
+            publicValueBase64 = Convert.ToBase64String(bPub.ToByteArray(isUnsigned: true, isBigEndian: true))
+        });
+        var privJson = JsonSerializer.Serialize(new
+        {
+            privateExponentBase64 = Convert.ToBase64String(b.ToByteArray(isUnsigned: true, isBigEndian: true))
+        });
+
+        options.TryGetValue("allowedNodes", out var allowedNodes);
+        var rec = new AsymmetricKeyRecord
+        {
+            KeyId = keyId,
+            AlgorithmCode = "DIFFIEHELLMAN",
+            OwnerNode = SqliteDatabaseService.LocalNodeId,
+            PublicParamsJson = pubJson,
+            PrivateParamsJson = privJson,
+            AllowedNodes = string.IsNullOrWhiteSpace(allowedNodes) ? null : allowedNodes,
+            CreatedAtUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        };
+        _db.SaveAsymmetricKey(rec);
+        return rec;
     }
 
     private (byte[] Bytes, string Text, string[] Steps, Dictionary<string, string> Params) DispatchAlgorithm(
